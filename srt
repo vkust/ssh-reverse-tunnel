@@ -637,9 +637,152 @@ cmd_uninstall() {
     info "tunnels and service definitions removed. Keys kept in $KEY_DIR (srt_*)."
 }
 
+# ---------- interactive menu and live monitor ----------
+
+is_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+clear_screen() { if is_tty; then printf '\033[H\033[2J'; fi; return 0; }
+
+ask_enter() { printf '\nEnter — назад ' >&2; _x=""; IFS= read -r _x || true; }
+
+menu_rows() { # numbered table of all tunnels, one line each
+    _i=0
+    for _n in $(tunnel_names); do
+        _i=$((_i + 1))
+        load "$_n"
+        printf '  %2d) %-12s %-16s %-6s -> %-22s %-14s %s\n' "$_i" "$NAME" "$VPS_HOST" \
+            "$REMOTE_PORT" "$TARGET_HOST:$TARGET_PORT" "${PROXY:-прямой}" "$(svc_status "$NAME")"
+    done
+    return 0
+}
+
+tunnel_by_index() { # tunnel_by_index N -> tunnel name, 1-based
+    _i=0
+    for _n in $(tunnel_names); do
+        _i=$((_i + 1))
+        if [ "$_i" = "$1" ]; then printf '%s' "$_n"; return 0; fi
+    done
+    return 1
+}
+
+pick_tunnel() { # pick_tunnel -> sets MENU_SEL; returns 1 when cancelled
+    MENU_SEL=""
+    if [ -z "$(tunnel_names)" ]; then
+        echo "  Туннелей пока нет. Добавьте туннель пунктом меню." >&2
+        return 1
+    fi
+    menu_rows
+    printf '  Номер туннеля (Enter — отмена): ' >&2
+    _x=""; IFS= read -r _x || _x=""
+    [ -n "$_x" ] || return 1
+    case "$_x" in *[!0-9]*) echo "  нужен номер" >&2; return 1 ;; esac
+    MENU_SEL="$(tunnel_by_index "$_x")" || { echo "  нет туннеля с номером $_x" >&2; return 1; }
+    [ -n "$MENU_SEL" ]
+}
+
+last_log_line() { # last_log_line NAME -> last line of the service log, short
+    _l=""
+    case "$(svc_mgr)" in
+        systemd) _l="$(journalctl --user -u "srt@$1.service" -n 1 --no-pager -o cat 2>/dev/null || true)" ;;
+        launchd) _l="$(tail -n 1 "$(launchd_log "$1")" 2>/dev/null || true)" ;;
+        procd)   _l="(смотрите: srt logs $1)" ;;
+        none)    _l="$(tail -n 1 "$RUN_DIR/$1.log" 2>/dev/null || true)" ;;
+    esac
+    [ -n "$_l" ] || _l="-"
+    printf '%s' "$_l" | cut -c1-100
+}
+
+cmd_monitor() { # live status of all tunnels; refreshes every 3 s, Ctrl-C returns
+    if [ -z "$(tunnel_names)" ]; then echo "Туннелей пока нет: srt add"; return 0; fi
+    MON_STOP=0
+    trap 'MON_STOP=1' INT
+    while [ "$MON_STOP" = 0 ]; do
+        clear_screen
+        echo "srt: мониторинг туннелей   обновление каждые 3 с, Ctrl-C — выход   $(date '+%H:%M:%S')"
+        echo
+        menu_rows
+        echo
+        echo "Последние строки логов:"
+        for _n in $(tunnel_names); do
+            printf '  %-12s %s\n' "$_n" "$(last_log_line "$_n")"
+        done
+        sleep 3 || true
+    done
+    trap - INT
+    return 0
+}
+
+tunnel_menu() { # tunnel_menu NAME: actions on one tunnel
+    _n="$1"
+    while :; do
+        clear_screen
+        load "$_n"
+        echo "Туннель '$_n':  $VPS_HOST:$REMOTE_PORT  ->  $TARGET_HOST:$TARGET_PORT   [$(svc_status "$_n")]"
+        echo
+        echo "  1) подробно"
+        echo "  2) запустить"
+        echo "  3) остановить"
+        echo "  4) перезапустить"
+        echo "  5) логи"
+        echo "  6) проверить через VPS"
+        echo "  7) публичный ключ для VPS"
+        echo "  8) удалить туннель"
+        echo "  0) назад"
+        printf '> ' >&2
+        _c=""; IFS= read -r _c || return 0
+        case "$_c" in
+            1) ( cmd_show "$_n" ) || true; ask_enter ;;
+            2) ( cmd_action start "$_n" ) || true; ask_enter ;;
+            3) ( cmd_action stop "$_n" ) || true; ask_enter ;;
+            4) ( cmd_action restart "$_n" ) || true; ask_enter ;;
+            5) ( cmd_logs "$_n" ) || true; ask_enter ;;
+            6) ( cmd_check "$_n" ) || true; ask_enter ;;
+            7) ( cmd_key "$_n" ) || true; ask_enter ;;
+            8) if ( cmd_remove "$_n" ); then return 0; fi; ask_enter ;;
+            0|"") return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+cmd_menu() { # top-level interactive menu
+    while :; do
+        clear_screen
+        echo "srt $SRT_VERSION — управление туннелями"
+        echo
+        if [ -n "$(tunnel_names)" ]; then menu_rows; else echo "  (туннелей пока нет)"; fi
+        echo
+        echo "  1) мониторинг (живой статус)"
+        echo "  2) управление туннелем"
+        echo "  3) добавить туннель"
+        echo "  4) проверить все туннели через VPS"
+        echo "  5) запустить все"
+        echo "  6) остановить все"
+        echo "  7) платформа и зависимости"
+        echo "  0) выход"
+        printf '> ' >&2
+        _c=""; IFS= read -r _c || return 0
+        case "$_c" in
+            1) ( cmd_monitor ) || true ;;
+            2) if pick_tunnel; then tunnel_menu "$MENU_SEL"; fi ;;
+            3) ( cmd_add ) || true; ask_enter ;;
+            4) ( cmd_check all ) || true; ask_enter ;;
+            5) ( cmd_action start all ) || true; ask_enter ;;
+            6) ( cmd_action stop all ) || true; ask_enter ;;
+            7) ( cmd_platform ) || true; ask_enter ;;
+            0|q|Q) return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
 usage() {
     cat <<EOF
 srt $SRT_VERSION: reverse SSH tunnels from this machine to a VPS
+
+  srt                          interactive menu (in a terminal)
+  srt menu                     interactive menu
+  srt monitor                  live status of all tunnels (Ctrl-C to exit)
 
   srt add [options]            add a tunnel (wizard; flags skip the questions)
   srt list                     list tunnels and their service status
@@ -666,10 +809,12 @@ EOF
 }
 
 main() {
-    _cmd="${1:-help}"
+    if [ $# -eq 0 ] && is_tty; then _cmd=menu; else _cmd="${1:-help}"; fi
     if [ $# -gt 0 ]; then shift; fi
     SRT_SELF="$(self_path)"
     case "$_cmd" in
+        menu) cmd_menu ;;
+        monitor|mon) cmd_monitor ;;
         add) cmd_add "$@" ;;
         list|ls) cmd_list ;;
         show) cmd_show "$@" ;;
