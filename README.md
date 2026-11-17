@@ -1,3 +1,7 @@
+**English** | **[Русский](README.ru.md)**
+
+---
+
 # srt: reverse SSH tunnels to a VPS
 
 `srt` opens tunnels **from a machine that has no inbound access** (behind NAT or a
