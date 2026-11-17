@@ -636,6 +636,168 @@ cmd_uninstall() {
     rm -rf "$RUN_DIR"
     info "tunnels and service definitions removed. Keys kept in $KEY_DIR (srt_*)."
 }
+# ---------- security ----------
+# srt security: hardening for a host that is exposed to the internet (the VPS) or
+# that holds a tunnel (the tunnel host). Run as root on the machine itself.
+#
+#   srt security status            read-only report: sshd, fail2ban, ufw, failed logins
+#   srt security fail2ban          install fail2ban with an sshd jail (5 fails / 10 min -> 1 h ban)
+#   srt security fail2ban-remove   stop fail2ban and remove the srt jail (package kept)
+#   srt security ufw-enable PORT.. default deny incoming; allow ssh and PORT... (tunnel ports)
+#   srt security ufw-disable       turn the firewall off
+#   srt security root-keys         PermitRootLogin prohibit-password (root by key only)
+#   srt security keys-only         PasswordAuthentication no, but only after the key login is
+#                                  verified: set SRT_SEC_KEY=/path/to/key [SRT_SEC_USER=name]
+#
+# Every sshd change is a drop-in file in /etc/ssh/sshd_config.d, checked with `sshd -t`
+# and rolled back on failure. The main sshd_config is never edited.
+
+sec_need_root() { [ "$(id -u)" = 0 ] || die "run as root: sudo srt security $1"; }
+
+sec_have() { command -v "$1" >/dev/null 2>&1; }
+
+sshd_opt() { # sshd_opt KEY -> effective value from sshd -T, or empty
+    sshd -T 2>/dev/null | awk -v k="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" '$1==k{print $2; exit}'
+}
+
+sshd_set() { # sshd_set KEY VALUE: drop-in file, validated, rolled back on failure
+    _k="$1"; _v="$2"
+    _dir=/etc/ssh/sshd_config.d
+    [ -d "$_dir" ] || die "no $_dir: this sshd does not support drop-in files"
+    # sshd takes the first value it reads, so the file name sorts early
+    _f="$_dir/00-srt-$(printf '%s' "$_k" | tr 'A-Z' 'a-z').conf"
+    _old=""
+    [ -f "$_f" ] && _old="$(cat "$_f")"
+    printf '%s %s\n' "$_k" "$_v" > "$_f.new" && mv "$_f.new" "$_f"
+    if ! sshd -t 2>/dev/null; then
+        if [ -n "$_old" ]; then printf '%s\n' "$_old" > "$_f"; else rm -f "$_f"; fi
+        die "sshd rejected $_k $_v; rolled back"
+    fi
+    info "sshd: $_k $_v  ($_f)"
+}
+
+sshd_reload() {
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh.service'; then
+        systemctl reload ssh 2>/dev/null || systemctl restart ssh
+    else
+        systemctl reload sshd 2>/dev/null || systemctl restart sshd
+    fi
+}
+
+sec_status() {
+    echo "sshd (effective):"
+    for k in passwordauthentication pubkeyauthentication permitrootlogin kbdinteractiveauthentication; do
+        printf '  %-30s %s\n' "$k" "$(sshd_opt "$k" 2>/dev/null || echo '?')"
+    done
+    echo "fail2ban:"
+    if sec_have fail2ban-client && fail2ban-client ping >/dev/null 2>&1; then
+        echo "  running; sshd jail: $(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p') banned now"
+    elif sec_have fail2ban-client; then echo "  installed, not running"
+    else echo "  not installed"; fi
+    echo "firewall (ufw):"
+    if sec_have ufw; then ufw status 2>/dev/null | sed 's/^/  /' | head -n 12; else echo "  not installed"; fi
+    echo "authorized keys for $(id -un): $(grep -c '^ssh-' "$HOME/.ssh/authorized_keys" 2>/dev/null || echo 0)"
+    echo "failed ssh logins, last 24 h: $(journalctl -u ssh -u sshd --since '24 hours ago' --no-pager 2>/dev/null | grep -c 'Failed ' || echo '?')"
+}
+
+sec_fail2ban_install() {
+    sec_need_root fail2ban
+    if ! sec_have fail2ban-client; then
+        if sec_have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban
+        elif sec_have dnf; then dnf install -y -q fail2ban
+        elif sec_have yum; then yum install -y -q fail2ban
+        elif sec_have pacman; then pacman -S --noconfirm --needed fail2ban
+        elif sec_have apk; then apk add --no-cache fail2ban
+        else die "no package manager for fail2ban"; fi
+    else
+        info "fail2ban already installed"
+    fi
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/srt-sshd.local <<'JAIL'
+# managed by srt security
+[sshd]
+enabled         = true
+port            = ssh
+backend         = systemd
+maxretry        = 5
+findtime        = 10m
+bantime         = 1h
+bantime.increment = true
+bantime.factor  = 2
+bantime.maxtime = 1w
+JAIL
+    systemctl enable --now fail2ban
+    sleep 2
+    info "fail2ban: sshd jail active"
+    fail2ban-client status sshd 2>/dev/null | sed 's/^/  /' || true
+}
+
+sec_fail2ban_remove() {
+    sec_need_root fail2ban
+    rm -f /etc/fail2ban/jail.d/srt-sshd.local
+    systemctl disable --now fail2ban >/dev/null 2>&1 || true
+    info "fail2ban stopped and the srt jail removed (package kept)"
+}
+
+sec_ufw_enable() { # PORT...: default deny incoming; ssh and the given ports stay open
+    sec_need_root ufw
+    if ! sec_have ufw; then
+        if sec_have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
+        else die "install ufw first"; fi
+    fi
+    _sshp="$(sshd_opt port 2>/dev/null || true)"; [ -n "$_sshp" ] || _sshp=22
+    ufw allow "$_sshp/tcp" >/dev/null
+    for p in "$@"; do ufw allow "$p/tcp" >/dev/null; done
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw --force enable >/dev/null
+    info "ufw enabled: ssh($_sshp) and tunnel ports: $*; default deny incoming"
+    ufw status | sed 's/^/  /'
+}
+
+sec_ufw_disable() { sec_need_root ufw; ufw --force disable >/dev/null; info "ufw disabled"; }
+
+sec_keys_check() { # sec_keys_check USER KEYFILE: real key login to this machine, no password
+    _u="$1"; _key="$2"
+    [ -r "$_key" ] || die "key not readable: $_key"
+    ssh -i "$_key" -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no \
+        -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$_u@localhost" true >/dev/null 2>&1
+}
+
+sec_keys_only() { # PasswordAuthentication no, but only after key login is confirmed
+    sec_need_root keys-only
+    _key="${SRT_SEC_KEY:-}"
+    [ -n "$_key" ] || die "set SRT_SEC_KEY=/path/to/private-key (the key that already logs in)"
+    _u="${SRT_SEC_USER:-$(id -un)}"
+    sec_keys_check "$_u" "$_key" || die "key login for $_u with $_key did NOT work; passwords stay on"
+    info "key login for $_u verified; disabling password login"
+    sshd_set PasswordAuthentication no
+    sshd_set KbdInteractiveAuthentication no
+    sshd_reload
+    info "password login is off. Keep the current session open and test a second login before closing it."
+}
+
+sec_root_keys() { # root works by key only (no password), other users unchanged
+    sec_need_root root-keys
+    sshd_set PermitRootLogin prohibit-password
+    sshd_reload
+    info "root login: key only"
+}
+
+cmd_security() {
+    _where="${1:-status}"
+    [ $# -gt 0 ] && shift
+    case "$_where" in
+        status)          sec_status ;;
+        fail2ban)        sec_fail2ban_install ;;
+        fail2ban-remove) sec_fail2ban_remove ;;
+        ufw-enable)      sec_ufw_enable "$@" ;;
+        ufw-disable)     sec_ufw_disable ;;
+        keys-only)       sec_keys_only ;;
+        root-keys)       sec_root_keys ;;
+        *) die "usage: srt security status|fail2ban|fail2ban-remove|ufw-enable PORT...|ufw-disable|keys-only|root-keys" ;;
+    esac
+}
 
 # ---------- interactive menu and live monitor ----------
 
@@ -745,6 +907,46 @@ tunnel_menu() { # tunnel_menu NAME: actions on one tunnel
     done
 }
 
+security_menu() { # interactive page for host hardening
+    while :; do
+        clear_screen
+        echo "Безопасность этого хоста"
+        echo
+        echo "  1) статус (только чтение)"
+        echo "  2) установить fail2ban (защита sshd от перебора паролей)"
+        echo "  3) удалить srt-jail fail2ban"
+        echo "  4) включить файрвол ufw (закрыть всё, кроме ssh и портов туннелей)"
+        echo "  5) выключить файрвол ufw"
+        echo "  6) root только по ключу (PermitRootLogin prohibit-password)"
+        echo "  7) вход только по ключу для всех (отключить пароли, с проверкой ключа)"
+        echo "  0) назад"
+        printf '> ' >&2
+        _c=""; IFS= read -r _c || return 0
+        case "$_c" in
+            1) ( cmd_security status ) || true; ask_enter ;;
+            2) if yesno "Установить и включить fail2ban?" y; then ( cmd_security fail2ban ) || true; fi; ask_enter ;;
+            3) if yesno "Убрать srt-jail fail2ban?" n; then ( cmd_security fail2ban-remove ) || true; fi; ask_enter ;;
+            4) printf '  Порты туннелей, которые надо оставить открытыми (через пробел, Enter — только ssh): ' >&2
+               _p=""; IFS= read -r _p || _p=""
+               if yesno "Включить ufw: закрыть входящие, открыть ssh и ${_p:-ничего}?" n; then
+                   # shellcheck disable=SC2086
+                   ( cmd_security ufw-enable $_p ) || true
+               fi; ask_enter ;;
+            5) if yesno "Выключить ufw?" n; then ( cmd_security ufw-disable ) || true; fi; ask_enter ;;
+            6) if yesno "Root войдёт только по ключу. Пароль для root перестанет работать. Продолжить?" n; then
+                   ( cmd_security root-keys ) || true
+               fi; ask_enter ;;
+            7) printf '  Путь к приватному ключу, который уже входит без пароля: ' >&2
+               _k=""; IFS= read -r _k || _k=""
+               if [ -n "$_k" ] && yesno "Проверю вход по этому ключу и отключу пароли. Продолжить?" n; then
+                   ( SRT_SEC_KEY="$_k" cmd_security keys-only ) || true
+               fi; ask_enter ;;
+            0|"") return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
 cmd_menu() { # top-level interactive menu
     while :; do
         clear_screen
@@ -759,6 +961,7 @@ cmd_menu() { # top-level interactive menu
         echo "  5) запустить все"
         echo "  6) остановить все"
         echo "  7) платформа и зависимости"
+        echo "  8) безопасность (fail2ban, ключи, файрвол)"
         echo "  0) выход"
         printf '> ' >&2
         _c=""; IFS= read -r _c || return 0
@@ -770,6 +973,7 @@ cmd_menu() { # top-level interactive menu
             5) ( cmd_action start all ) || true; ask_enter ;;
             6) ( cmd_action stop all ) || true; ask_enter ;;
             7) ( cmd_platform ) || true; ask_enter ;;
+            8) security_menu ;;
             0|q|Q) return 0 ;;
             *) ;;
         esac
@@ -793,6 +997,8 @@ srt $SRT_VERSION: reverse SSH tunnels from this machine to a VPS
   srt check [NAME|all]         VPS login, remote listener, service state
   srt key NAME                 public key to install on the VPS
   srt setup-vps                run on the VPS as root: GatewayPorts for public binds
+  srt security status|fail2ban|ufw-enable PORT..|keys-only|root-keys
+                               host hardening (root): see: srt help security
   srt platform                 detect OS, package format, arch, service manager
   srt uninstall                remove all tunnels and service definitions
   srt run NAME                 run one tunnel in the foreground (for services)
@@ -825,6 +1031,7 @@ main() {
         key) cmd_key "$@" ;;
         run) cmd_run "$@" ;;
         setup-vps) cmd_setup_vps ;;
+        security|sec) cmd_security "$@" ;;
         platform) cmd_platform ;;
         uninstall) cmd_uninstall ;;
         version|--version) echo "$SRT_VERSION" ;;
