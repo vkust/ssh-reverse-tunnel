@@ -1,0 +1,691 @@
+#!/bin/sh
+# srt: reverse SSH tunnels from this machine to one or more VPS hosts.
+#
+# A tunnel forwards  VPS:REMOTE_PORT  ->  TARGET_HOST:TARGET_PORT.
+# TARGET_HOST is resolved from THIS machine: 127.0.0.1 is this machine, any
+# other address is a host of the local network this machine can reach.
+# The tunnel is always opened by this machine, outward to the VPS, optionally
+# through an HTTP CONNECT proxy. Nothing else in the path needs to be running.
+#
+# POSIX sh only. Service backends: systemd (Linux), launchd (macOS), procd (OpenWrt).
+set -eu
+
+SRT_VERSION="1.0.0"
+CONF_DIR="${SRT_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/srt}"
+TUN_DIR="$CONF_DIR/tunnels"
+RUN_DIR="$CONF_DIR/run"
+KNOWN_HOSTS="$CONF_DIR/known_hosts"
+KEY_DIR="${SRT_KEY_DIR:-$HOME/.ssh}"
+ASSUME_YES="${ASSUME_YES:-0}"
+
+info() { printf '==> %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die()  { printf 'xx  %s\n' "$*" >&2; exit 1; }
+
+# ---------- prompts ----------
+
+pick() { # pick OVERRIDE PROMPT DEFAULT -> value; OVERRIDE wins, else ask
+    if [ -n "$1" ]; then printf '%s' "$1"; return 0; fi
+    if [ "$ASSUME_YES" = 1 ]; then printf '%s' "$3"; return 0; fi
+    if [ -n "$3" ]; then printf '%s [%s]: ' "$2" "$3" >&2; else printf '%s: ' "$2" >&2; fi
+    _a=""; IFS= read -r _a || _a=""
+    if [ -n "$_a" ]; then printf '%s' "$_a"; else printf '%s' "$3"; fi
+}
+
+yesno() { # yesno PROMPT [y|n] -> exit 0 when yes
+    _d="${2:-n}"
+    if [ "$ASSUME_YES" = 1 ]; then [ "$_d" = y ] && return 0 || return 1; fi
+    printf '%s [%s]: ' "$1" "$_d" >&2
+    _a=""; IFS= read -r _a || _a=""
+    [ -n "$_a" ] || _a="$_d"
+    case "$_a" in y|Y|yes|Yes|YES) return 0;; *) return 1;; esac
+}
+
+# ---------- validation ----------
+
+is_port() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_name() { case "$1" in ''|-*|*-|*[!a-z0-9-]*) return 1;; esac; [ "${#1}" -le 32 ]; }
+is_host() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1;; esac; return 0; }
+is_user() { case "$1" in ''|[!A-Za-z_]*|*[!A-Za-z0-9._-]*) return 1;; esac; return 0; }
+is_ipv4() { case "$1" in ''|*[!0-9.]*) return 1;; esac; return 0; }
+
+# ---------- tunnel config ----------
+
+tunnel_names() {
+    for _f in "$TUN_DIR"/*.conf; do
+        [ -f "$_f" ] || continue
+        basename "$_f" .conf
+    done
+    return 0
+}
+
+load() { # load NAME: source a tunnel config into shell variables
+    [ -f "$TUN_DIR/$1.conf" ] || die "no tunnel named '$1' (see: srt list)"
+    # shellcheck disable=SC1090
+    . "$TUN_DIR/$1.conf"
+}
+
+first_field() { # first_field VAR -> VAR from the first saved tunnel (defaults for the wizard)
+    for _n in $(tunnel_names); do
+        ( . "$TUN_DIR/$_n.conf"; eval "printf '%s' \"\${$1:-}\"" )
+        return 0
+    done
+    return 0
+}
+
+port_owner() { # port_owner VPS PORT -> name of the tunnel that uses PORT on VPS
+    for _n in $(tunnel_names); do
+        if ( . "$TUN_DIR/$_n.conf"; [ "$VPS_HOST" = "$1" ] && [ "$REMOTE_PORT" = "$2" ] ); then
+            printf '%s' "$_n"; return 0
+        fi
+    done
+    return 0
+}
+
+next_free_port() { # next_free_port VPS -> first port >= 2222 not used on VPS
+    _p=2222
+    while [ -n "$(port_owner "$1" "$_p")" ]; do _p=$((_p + 1)); done
+    printf '%s' "$_p"
+}
+
+key_in_use() { # key_in_use FILE -> 0 when a saved tunnel uses that key
+    for _o in $(tunnel_names); do
+        if ( . "$TUN_DIR/$_o.conf"; [ "$KEY_FILE" = "$1" ] ); then return 0; fi
+    done
+    return 1
+}
+
+key_path_for() { # one key per VPS host
+    printf '%s/srt_%s' "$KEY_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+save_tunnel() { # save_tunnel: writes $TUN_DIR/$NAME.conf from the current variables
+    mkdir -p "$TUN_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+    umask 077
+    _f="$TUN_DIR/$NAME.conf"
+    {
+        echo "# srt tunnel '$NAME'. Managed by srt; change it with: srt remove $NAME && srt add"
+        echo "NAME='$NAME'"
+        echo "VPS_HOST='$VPS_HOST'"
+        echo "VPS_USER='$VPS_USER'"
+        echo "VPS_SSH_PORT='$VPS_SSH_PORT'"
+        echo "REMOTE_PORT='$REMOTE_PORT'"
+        echo "BIND_ADDR='$BIND_ADDR'"
+        echo "TARGET_HOST='$TARGET_HOST'"
+        echo "TARGET_PORT='$TARGET_PORT'"
+        echo "PROXY='$PROXY'"
+        echo "KEY_FILE='$KEY_FILE'"
+    } > "$_f.tmp"
+    mv "$_f.tmp" "$_f"
+}
+
+# ---------- platform ----------
+
+self_path() {
+    case "$0" in
+        */*) _p="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+        *) if [ -f "$0" ]; then _p="$(pwd)/$0"; else _p="$(command -v "$0" 2>/dev/null || echo "$0")"; fi ;;
+    esac
+    printf '%s' "$_p"
+}
+
+SRT_SHARE_BAKED=""   # set by install.sh to the directory holding proxy_connect.py
+
+share_dir() { # directory holding proxy_connect.py
+    _self_dir="$(dirname "${SRT_SELF:-$0}")"
+    for _d in "${SRT_SHARE_DIR:-}" "$SRT_SHARE_BAKED" "$_self_dir/scripts" "$_self_dir/../scripts" \
+              /usr/lib/srt /usr/local/share/srt "$HOME/.local/share/srt"; do
+        if [ -n "$_d" ] && [ -f "$_d/proxy_connect.py" ]; then printf '%s' "$_d"; return 0; fi
+    done
+    return 1
+}
+
+svc_mgr() {
+    case "$(uname -s)" in Darwin) echo launchd; return 0;; esac
+    if [ -f /etc/openwrt_release ]; then echo procd; return 0; fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        echo systemd; return 0
+    fi
+    echo none
+}
+
+pkg_format() { # native package format of this system
+    if [ -f /etc/openwrt_release ]; then
+        if command -v apk >/dev/null 2>&1; then echo apk; else echo ipk; fi
+        return 0
+    fi
+    for _m in apt-get:deb dnf:rpm yum:rpm zypper:rpm pacman:pacman apk:apk opkg:ipk brew:brew; do
+        if command -v "${_m%%:*}" >/dev/null 2>&1; then echo "${_m##*:}"; return 0; fi
+    done
+    echo none
+}
+
+pkg_arch() { # architecture name in the native package format
+    case "$1" in
+        deb) dpkg --print-architecture 2>/dev/null || uname -m ;;
+        ipk) opkg print-architecture 2>/dev/null | awk '$1=="arch"{a=$2} END{print a}' || true ;;
+        *)   uname -m ;;
+    esac
+}
+
+cmd_platform() {
+    _os="$(uname -s)"
+    if [ "$_os" = Linux ]; then
+        _name="$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}" )"
+    else
+        _name="$_os $(sw_vers -productVersion 2>/dev/null || true)"
+    fi
+    _fmt="$(pkg_format)"
+    _parch="$(pkg_arch "$_fmt")"
+    [ -n "$_parch" ] || _parch="$(uname -m)"
+    _ssh=no; command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 && _ssh=yes
+    _py=no; command -v python3 >/dev/null 2>&1 && _py=yes
+    _nc=no; command -v nc >/dev/null 2>&1 && _nc=yes
+    echo "os=$_name"
+    echo "kernel=$_os"
+    echo "arch=$(uname -m)"
+    echo "pkg_format=$_fmt"
+    echo "pkg_arch=$_parch"
+    echo "service=$(svc_mgr)"
+    echo "ssh=$_ssh"
+    echo "python3=$_py"
+    echo "nc=$_nc"
+}
+
+# ---------- ssh to the VPS ----------
+
+proxy_cmd() { # ProxyCommand prefix; the caller appends %h %p
+    # proxy_connect.py reads HTTPS_PROXY from the environment, so the proxy URL
+    # (which may contain credentials) never appears in argv or ps output.
+    if command -v python3 >/dev/null 2>&1; then
+        _sd="$(share_dir)" || die "proxy_connect.py not found (set SRT_SHARE_DIR)"
+        printf "python3 '%s/proxy_connect.py'" "$_sd"
+    elif command -v nc >/dev/null 2>&1; then
+        # OpenBSD netcat supports CONNECT but not proxy auth; host:port only
+        _hp="$(printf '%s' "$PROXY" | sed -e 's#^[a-zA-Z]*://##' -e 's#^[^@]*@##' -e 's#/.*$##')"
+        printf 'nc -X connect -x %s' "$_hp"
+    else
+        die "proxy mode needs python3 or nc with -X connect"
+    fi
+}
+
+vps_ssh() { # ssh to the VPS with the loaded tunnel's settings; remaining args go to ssh
+    if [ -n "${PROXY:-}" ]; then
+        # die here, before any output is redirected by the caller, so the reason shows
+        _pc="$(proxy_cmd)" || { echo "xx  proxy helper not found (set SRT_SHARE_DIR or reinstall)" >&2; return 1; }
+        HTTPS_PROXY="$PROXY"; export HTTPS_PROXY
+        set -- -o "ProxyCommand=$_pc %h %p" "$@"
+    fi
+    ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+        -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+        -o ExitOnForwardFailure=yes -p "$VPS_SSH_PORT" "$@"
+}
+
+# ---------- services ----------
+
+plist_path() { printf '%s/Library/LaunchAgents/com.srt.%s.plist' "$HOME" "$1"; }
+launchd_log() { printf '%s/Library/Logs/srt-%s.log' "$HOME" "$1"; }
+
+systemd_install_unit() {
+    _ud="$HOME/.config/systemd/user"
+    mkdir -p "$_ud"
+    # Units do not inherit the shell environment; pin the config dir explicitly.
+    cat > "$_ud/srt@.service" <<EOF
+[Unit]
+Description=srt reverse SSH tunnel %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=SRT_CONF_DIR=$CONF_DIR
+ExecStart="$SRT_SELF" run %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+}
+
+launchd_write() { # launchd_write NAME
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    cat > "$(plist_path "$1")" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.srt.$1</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$SRT_SELF</string>
+        <string>run</string>
+        <string>$1</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>$(launchd_log "$1")</string>
+    <key>StandardErrorPath</key><string>$(launchd_log "$1")</string>
+</dict>
+</plist>
+EOF
+}
+
+procd_install() { # OpenWrt: one init script starts every tunnel as its own procd instance
+    cat > /etc/init.d/srt <<EOF
+#!/bin/sh /etc/rc.common
+# Generated by srt. Starts one procd instance per tunnel in $TUN_DIR.
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    for f in "$TUN_DIR"/*.conf; do
+        [ -f "\$f" ] || continue
+        n=\$(basename "\$f" .conf)
+        procd_open_instance "\$n"
+        procd_set_param command "$SRT_SELF" run "\$n"
+        procd_set_param env HOME="$HOME" SRT_CONF_DIR="$CONF_DIR"
+        procd_set_param respawn 3600 5 5
+        procd_set_param stderr 1
+        procd_close_instance
+    done
+}
+EOF
+    chmod 755 /etc/init.d/srt
+}
+
+run_bg() { # service fallback when there is no service manager
+    mkdir -p "$RUN_DIR"
+    if [ -f "$RUN_DIR/$1.pid" ] && kill -0 "$(cat "$RUN_DIR/$1.pid")" 2>/dev/null; then return 0; fi
+    nohup "$SRT_SELF" run "$1" >> "$RUN_DIR/$1.log" 2>&1 </dev/null &
+    echo $! > "$RUN_DIR/$1.pid"
+}
+
+svc_start() {
+    case "$(svc_mgr)" in
+        systemd)
+            systemd_install_unit
+            systemctl --user enable "srt@$1.service" >/dev/null 2>&1 || warn "could not enable srt@$1 (no user systemd session?)"
+            systemctl --user restart "srt@$1.service" ;;
+        launchd)
+            launchd_write "$1"
+            launchctl bootout "gui/$(id -u)/com.srt.$1" >/dev/null 2>&1 || true
+            launchctl bootstrap "gui/$(id -u)" "$(plist_path "$1")" ;;
+        procd)
+            procd_install
+            /etc/init.d/srt enable
+            /etc/init.d/srt restart ;;
+        none) run_bg "$1" ;;
+    esac
+}
+
+svc_stop() {
+    case "$(svc_mgr)" in
+        systemd) systemctl --user stop "srt@$1.service" >/dev/null 2>&1 || true ;;
+        launchd) launchctl bootout "gui/$(id -u)/com.srt.$1" >/dev/null 2>&1 || true ;;
+        procd)   warn "OpenWrt: procd stops all srt tunnels together"; /etc/init.d/srt stop || true ;;
+        none)
+            if [ -f "$RUN_DIR/$1.pid" ]; then
+                kill "$(cat "$RUN_DIR/$1.pid")" 2>/dev/null || true
+                rm -f "$RUN_DIR/$1.pid"
+            fi ;;
+    esac
+}
+
+svc_status() {
+    case "$(svc_mgr)" in
+        systemd) systemctl --user is-active "srt@$1.service" 2>/dev/null || true ;;
+        launchd) if launchctl print "gui/$(id -u)/com.srt.$1" >/dev/null 2>&1; then echo loaded; else echo not-loaded; fi ;;
+        procd)   if ps 2>/dev/null | grep "[s]rt run $1" >/dev/null; then echo running; else echo stopped; fi ;;
+        none)
+            if [ -f "$RUN_DIR/$1.pid" ] && kill -0 "$(cat "$RUN_DIR/$1.pid")" 2>/dev/null; then echo running; else echo stopped; fi ;;
+    esac
+}
+
+svc_remove() { # after the tunnel config is deleted
+    case "$(svc_mgr)" in
+        systemd) systemctl --user disable "srt@$1.service" >/dev/null 2>&1 || true ;;
+        launchd) rm -f "$(plist_path "$1")" ;;
+        procd)   if [ -x /etc/init.d/srt ]; then /etc/init.d/srt restart || true; fi ;;
+        none)    rm -f "$RUN_DIR/$1.pid" ;;
+    esac
+}
+
+# ---------- commands ----------
+
+cmd_add() {
+    o_name="" o_vps="" o_user="" o_vport="" o_proxy="" o_target="" o_tport="" o_rport="" o_bind="" o_key=""
+    o_nostart=0 o_nocheck=0 o_force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)        o_name=$(val "$@"); shift ;;
+            --vps)         o_vps=$(val "$@"); shift ;;
+            --vps-user)    o_user=$(val "$@"); shift ;;
+            --vps-port)    o_vport=$(val "$@"); shift ;;
+            --proxy)       o_proxy=$(val "$@"); shift ;;
+            --no-proxy)    o_proxy="-" ;;
+            --target)      o_target=$(val "$@"); shift ;;
+            --target-port) o_tport=$(val "$@"); shift ;;
+            --remote-port) o_rport=$(val "$@"); shift ;;
+            --bind)        o_bind=$(val "$@"); shift ;;
+            --key)         o_key=$(val "$@"); shift ;;
+            --no-start)    o_nostart=1 ;;
+            --no-check)    o_nocheck=1 ;;
+            --force)       o_force=1 ;;
+            -y|--yes)      ASSUME_YES=1 ;;
+            *) die "unknown option for add: $1" ;;
+        esac
+        shift
+    done
+
+    info "add a reverse tunnel (Ctrl-C to abort)"
+
+    NAME=$(pick "$o_name" "Tunnel name (a-z, 0-9, dashes)" "home")
+    is_name "$NAME" || die "invalid tunnel name: '$NAME'"
+    if [ -f "$TUN_DIR/$NAME.conf" ]; then
+        if [ "$o_force" = 1 ] || { [ "$ASSUME_YES" != 1 ] && yesno "Tunnel '$NAME' already exists. Replace it?" n; }; then
+            :
+        else
+            die "tunnel '$NAME' already exists (use --force to replace)"
+        fi
+    fi
+
+    VPS_HOST=$(pick "$o_vps" "VPS address (host or IP)" "$(first_field VPS_HOST)")
+    is_host "$VPS_HOST" || die "invalid VPS address: '$VPS_HOST'"
+
+    VPS_USER=$(pick "$o_user" "VPS SSH user" "root")
+    is_user "$VPS_USER" || die "invalid user: '$VPS_USER'"
+
+    VPS_SSH_PORT=$(pick "$o_vport" "VPS SSH port" "22")
+    is_port "$VPS_SSH_PORT" || die "invalid port: '$VPS_SSH_PORT'"
+
+    if [ -n "$o_proxy" ]; then
+        PROXY="$o_proxy"
+    else
+        PROXY=$(pick "" "Outbound HTTP proxy host:port (empty = direct)" "$(first_field PROXY)")
+    fi
+    [ "$PROXY" = "-" ] && PROXY=""
+    case "$PROXY" in *"'"*|*"\""*|*" "*) die "proxy value contains quotes or spaces" ;; esac
+
+    TARGET_HOST=$(pick "$o_target" "Host to expose (127.0.0.1 = this machine, or a LAN address)" "127.0.0.1")
+    is_host "$TARGET_HOST" || die "invalid target host: '$TARGET_HOST'"
+
+    TARGET_PORT=$(pick "$o_tport" "Target port" "22")
+    is_port "$TARGET_PORT" || die "invalid target port: '$TARGET_PORT'"
+
+    REMOTE_PORT=$(pick "$o_rport" "Port opened on the VPS" "$(next_free_port "$VPS_HOST")")
+    is_port "$REMOTE_PORT" || die "invalid remote port: '$REMOTE_PORT'"
+    _owner="$(port_owner "$VPS_HOST" "$REMOTE_PORT")"
+    if [ -n "$_owner" ] && [ "$_owner" != "$NAME" ]; then
+        die "port $REMOTE_PORT on $VPS_HOST is already used by tunnel '$_owner'"
+    fi
+
+    BIND_ADDR=$(pick "$o_bind" "Bind address on the VPS (0.0.0.0 = public, 127.0.0.1 = local only)" "0.0.0.0")
+    is_ipv4 "$BIND_ADDR" || die "invalid bind address: '$BIND_ADDR'"
+
+    KEY_FILE=$(pick "$o_key" "SSH key for this VPS" "$(key_path_for "$VPS_HOST")")
+    case "$KEY_FILE" in *"'"*|*" "*) die "key path contains quotes or spaces" ;; esac
+
+    if [ ! -f "$KEY_FILE" ]; then
+        mkdir -p "$(dirname "$KEY_FILE")"; chmod 700 "$(dirname "$KEY_FILE")" 2>/dev/null || true
+        ssh-keygen -q -t ed25519 -N "" -C "srt@$(hostname 2>/dev/null || echo host)" -f "$KEY_FILE" </dev/null
+        info "generated key $KEY_FILE"
+    fi
+
+    save_tunnel
+    info "saved tunnel '$NAME' ($CONF_DIR/tunnels/$NAME.conf)"
+
+    if [ "$o_nocheck" = 0 ] && [ "$o_nostart" = 0 ]; then
+        if vps_ssh "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1; then
+            info "key login to the VPS works"
+        else
+            warn "key login to the VPS failed. The public key is not on the VPS yet:"
+            cat "$KEY_FILE.pub" >&2
+            if [ "$ASSUME_YES" != 1 ] && yesno "Install the key on the VPS now with ssh-copy-id (asks the VPS password once)?" y; then
+                if [ -n "$PROXY" ]; then
+                    ssh-copy-id -i "$KEY_FILE.pub" -o "UserKnownHostsFile=$KNOWN_HOSTS" -o "ProxyCommand=$(proxy_cmd) %h %p" -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_HOST" || warn "ssh-copy-id failed"
+                else
+                    ssh-copy-id -i "$KEY_FILE.pub" -o "UserKnownHostsFile=$KNOWN_HOSTS" -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_HOST" || warn "ssh-copy-id failed"
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$o_nostart" = 0 ]; then
+        svc_start "$NAME"
+        info "service started: $(svc_status "$NAME")"
+        if [ "$(svc_mgr)" = systemd ] && ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q yes; then
+            warn "linger is off: the tunnel stops at logout and does not start at boot."
+            warn "fix with: sudo loginctl enable-linger $(id -un)"
+        fi
+    else
+        info "service not started (--no-start). Start later: srt start $NAME"
+    fi
+
+    echo
+    info "done. From anywhere:  ssh -p $REMOTE_PORT <user-on-this-machine>@$VPS_HOST"
+    if [ "$TARGET_HOST" != 127.0.0.1 ] && [ "$TARGET_HOST" != localhost ]; then
+        info "this exposes $TARGET_HOST:$TARGET_PORT from the local network"
+    fi
+}
+
+val() { # val OPTION VALUE... -> prints the value of an option
+    [ $# -ge 2 ] || die "option $1 needs a value"
+    printf '%s' "$2"
+}
+
+cmd_list() {
+    _names="$(tunnel_names)"
+    if [ -z "$_names" ]; then echo "no tunnels yet: srt add"; return 0; fi
+    printf '%-14s %-18s %-7s %-22s %-20s %s\n' NAME VPS REMOTE TARGET VIA STATUS
+    for _n in $_names; do
+        load "$_n"
+        printf '%-14s %-18s %-7s %-22s %-20s %s\n' "$NAME" "$VPS_HOST" "$REMOTE_PORT" \
+            "$TARGET_HOST:$TARGET_PORT" "${PROXY:-direct}" "$(svc_status "$NAME")"
+    done
+}
+
+cmd_show() {
+    [ $# -ge 1 ] || die "usage: srt show NAME"
+    load "$1"
+    echo "name:        $NAME"
+    echo "vps:         $VPS_USER@$VPS_HOST:$VPS_SSH_PORT"
+    echo "remote:      $BIND_ADDR:$REMOTE_PORT  (on the VPS)"
+    echo "target:      $TARGET_HOST:$TARGET_PORT  (from this machine)"
+    echo "proxy:       ${PROXY:-direct}"
+    echo "key:         $KEY_FILE"
+    echo "service:     $(svc_status "$NAME")"
+}
+
+cmd_remove() {
+    [ $# -ge 1 ] || die "usage: srt remove NAME [--purge-key]"
+    _n="$1"; shift
+    _purge=0
+    for _a in "$@"; do
+        case "$_a" in
+            --purge-key) _purge=1 ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            *) die "unknown option for remove: $_a" ;;
+        esac
+    done
+    load "$_n"
+    yesno "Remove tunnel '$_n' ($VPS_HOST:$REMOTE_PORT -> $TARGET_HOST:$TARGET_PORT)?" y || die "aborted"
+    _key="$KEY_FILE"
+    svc_stop "$_n"
+    rm -f "$TUN_DIR/$_n.conf"
+    svc_remove "$_n"
+    info "removed tunnel '$_n'"
+    if [ "$_purge" = 1 ]; then
+        if key_in_use "$_key"; then
+            warn "key $_key is still used by another tunnel, kept"
+        else
+            rm -f "$_key" "$_key.pub"
+            info "removed key $_key"
+        fi
+    else
+        info "kept key $_key (use --purge-key to delete it)"
+    fi
+}
+
+cmd_action() { # start|stop|restart|status NAME|all
+    _act="${1:-}"; _t="${2:-all}"
+    [ -n "$_act" ] || die "usage: srt start|stop|restart|status [NAME|all]"
+    if [ "$_t" = all ]; then
+        _names="$(tunnel_names)"
+    else
+        [ -f "$TUN_DIR/$_t.conf" ] || die "no tunnel named '$_t'"
+        _names="$_t"
+    fi
+    for _n in $_names; do
+        case "$_act" in
+            start)   svc_start "$_n"; info "$_n: started" ;;
+            stop)    svc_stop "$_n"; info "$_n: stopped" ;;
+            restart) svc_stop "$_n"; svc_start "$_n"; info "$_n: restarted" ;;
+            status)  printf '%-14s %s\n' "$_n" "$(svc_status "$_n")" ;;
+            *) die "unknown action: $_act" ;;
+        esac
+    done
+}
+
+cmd_logs() {
+    [ $# -ge 1 ] || die "usage: srt logs NAME [-f]"
+    _n="$1"; _f="${2:-}"
+    load "$_n"
+    case "$(svc_mgr)" in
+        systemd)
+            if [ "$_f" = -f ]; then journalctl --user -u "srt@$_n.service" -f
+            else journalctl --user -u "srt@$_n.service" -n 100 --no-pager; fi ;;
+        launchd)
+            if [ "$_f" = -f ]; then tail -f "$(launchd_log "$_n")"; else tail -n 100 "$(launchd_log "$_n")"; fi ;;
+        procd) logread | grep "srt" | tail -n 100 ;;
+        none)  tail -n 100 "$RUN_DIR/$_n.log" 2>/dev/null || echo "no log yet" ;;
+    esac
+}
+
+cmd_check() { # check tunnel(s): VPS login through the proxy, remote listener, service
+    _t="${1:-all}"
+    if [ "$_t" = all ]; then _names="$(tunnel_names)"; else _names="$_t"; fi
+    for _n in $_names; do
+        load "$_n"
+        echo "$_n:"
+        if vps_ssh "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1; then
+            echo "  vps login via key:          ok"
+            if vps_ssh "$VPS_USER@$VPS_HOST" "(ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q ':$REMOTE_PORT '" >/dev/null 2>&1; then
+                if [ "$(svc_status "$_n")" = active ] || [ "$(svc_status "$_n")" = running ]; then
+                    echo "  VPS listens on :$REMOTE_PORT:    yes (tunnel service is up)"
+                else
+                    echo "  VPS listens on :$REMOTE_PORT:    yes, but this tunnel is not running (port may belong to another tunnel)"
+                fi
+            else
+                echo "  VPS listens on :$REMOTE_PORT:    no (tunnel is down or GatewayPorts is off)"
+            fi
+        else
+            echo "  vps login via key:          FAILED (proxy, key or VPS address)"
+        fi
+        echo "  service:                    $(svc_status "$_n")"
+    done
+}
+
+cmd_key() {
+    [ $# -ge 1 ] || die "usage: srt key NAME"
+    load "$1"
+    echo "private key: $KEY_FILE"
+    if [ -f "$KEY_FILE.pub" ]; then cat "$KEY_FILE.pub"; else echo "(no public key yet)"; fi
+}
+
+cmd_run() { # foreground run of one tunnel; the service managers call this
+    [ $# -ge 1 ] || die "usage: srt run NAME"
+    load "$1"
+    [ -r "$KEY_FILE" ] || die "key not readable: $KEY_FILE"
+    vps_ssh -N -R "$BIND_ADDR:$REMOTE_PORT:$TARGET_HOST:$TARGET_PORT" "$VPS_USER@$VPS_HOST"
+}
+
+cmd_setup_vps() { # run on the VPS as root
+    [ "$(id -u)" = 0 ] || die "run as root on the VPS: sudo srt setup-vps"
+    _cfg=/etc/ssh/sshd_config
+    cp "$_cfg" "$_cfg.bak.$(date +%s)"
+    if grep -qE '^[[:space:]]*GatewayPorts' "$_cfg"; then
+        sed -i -E 's/^[[:space:]]*GatewayPorts.*/GatewayPorts clientspecified/' "$_cfg"
+    else
+        printf '\nGatewayPorts clientspecified\n' >> "$_cfg"
+    fi
+    sshd -t || die "sshd config test failed; restore from $_cfg.bak.*"
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh.service'; then systemctl restart ssh; else systemctl restart sshd; fi
+    info "GatewayPorts clientspecified set, sshd restarted (backup: $_cfg.bak.*)"
+    info "open the tunnel ports in your firewall, e.g. ufw allow <port>/tcp"
+}
+
+cmd_uninstall() {
+    for _n in $(tunnel_names); do
+        svc_stop "$_n"
+        rm -f "$TUN_DIR/$_n.conf"
+        svc_remove "$_n"
+        info "removed tunnel '$_n'"
+    done
+    [ -f "$HOME/.config/systemd/user/srt@.service" ] && rm -f "$HOME/.config/systemd/user/srt@.service" && systemctl --user daemon-reload >/dev/null 2>&1 || true
+    [ -f /etc/init.d/srt ] && rm -f /etc/init.d/srt || true
+    rm -rf "$RUN_DIR"
+    info "tunnels and service definitions removed. Keys kept in $KEY_DIR (srt_*)."
+}
+
+usage() {
+    cat <<EOF
+srt $SRT_VERSION: reverse SSH tunnels from this machine to a VPS
+
+  srt add [options]            add a tunnel (wizard; flags skip the questions)
+  srt list                     list tunnels and their service status
+  srt show NAME                show one tunnel
+  srt remove NAME [--purge-key] [-y]
+  srt start|stop|restart|status [NAME|all]
+  srt logs NAME [-f]           service logs
+  srt check [NAME|all]         VPS login, remote listener, service state
+  srt key NAME                 public key to install on the VPS
+  srt setup-vps                run on the VPS as root: GatewayPorts for public binds
+  srt platform                 detect OS, package format, arch, service manager
+  srt uninstall                remove all tunnels and service definitions
+  srt run NAME                 run one tunnel in the foreground (for services)
+
+add options:
+  --name NAME  --vps HOST  --vps-user USER  --vps-port PORT
+  --proxy HOST:PORT | --no-proxy   (proxy for outbound SSH; empty = direct)
+  --target HOST  --target-port PORT   (what to expose; 127.0.0.1 = this machine)
+  --remote-port PORT  --bind ADDR  --key FILE
+  --no-start  --no-check  --force  -y
+
+Config: $CONF_DIR/tunnels/*.conf
+EOF
+}
+
+main() {
+    _cmd="${1:-help}"
+    if [ $# -gt 0 ]; then shift; fi
+    SRT_SELF="$(self_path)"
+    case "$_cmd" in
+        add) cmd_add "$@" ;;
+        list|ls) cmd_list ;;
+        show) cmd_show "$@" ;;
+        remove|rm) cmd_remove "$@" ;;
+        start|stop|restart|status) cmd_action "$_cmd" "$@" ;;
+        logs) cmd_logs "$@" ;;
+        check) cmd_check "$@" ;;
+        key) cmd_key "$@" ;;
+        run) cmd_run "$@" ;;
+        setup-vps) cmd_setup_vps ;;
+        platform) cmd_platform ;;
+        uninstall) cmd_uninstall ;;
+        version|--version) echo "$SRT_VERSION" ;;
+        help|-h|--help) usage ;;
+        *) die "unknown command: $_cmd (try: srt help)" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,54 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests (proxy helper)
+        run: python3 -m unittest discover -s tests -v
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (POSIX sh)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -s sh install.sh srt
+      - name: sh syntax
+        run: sh -n install.sh && sh -n srt
+
+  install-cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install, add tunnels, list, remove, uninstall on a throwaway HOME
+        env:
+          HOME: ${{ runner.temp }}/fakehome
+          SRT_CONF_DIR: ${{ runner.temp }}/fakehome/.config/srt
+        run: |
+          mkdir -p "$HOME"
+          sh install.sh --prefix "$HOME/bin" -y --vps 192.0.2.1 --no-tunnel
+          test -x "$HOME/bin/srt"
+          "$HOME/bin/srt" add -y --name lan --vps 192.0.2.1 --target 10.0.0.5 --target-port 80 \
+              --remote-port 2222 --no-proxy --no-start --no-check --key "$HOME/k1"
+          "$HOME/bin/srt" add -y --name self --vps 192.0.2.1 --target 127.0.0.1 --target-port 22 \
+              --remote-port 2223 --no-proxy --no-start --no-check --key "$HOME/k2"
+          # a port already used on the same VPS must be refused
+          if "$HOME/bin/srt" add -y --name clash --vps 192.0.2.1 --target 127.0.0.1 --target-port 22 \
+              --remote-port 2222 --no-proxy --no-start --no-check --key "$HOME/k3" 2>/dev/null; then
+            echo "port clash was not refused"; exit 1
+          fi
+          "$HOME/bin/srt" list | grep -q lan
+          "$HOME/bin/srt" remove lan -y
+          ! "$HOME/bin/srt" list | grep -q '^lan '
+          sh install.sh --prefix "$HOME/bin" --uninstall
+          test ! -e "$HOME/bin/srt"
