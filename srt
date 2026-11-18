@@ -520,10 +520,27 @@ cmd_remove() {
     load "$_n"
     yesno "Remove tunnel '$_n' ($VPS_HOST:$REMOTE_PORT -> $TARGET_HOST:$TARGET_PORT)?" y || die "aborted"
     _key="$KEY_FILE"
+    _vps="$VPS_USER@$VPS_HOST"; _rport="$REMOTE_PORT"
     svc_stop "$_n"
     rm -f "$TUN_DIR/$_n.conf"
     svc_remove "$_n"
     info "removed tunnel '$_n'"
+    # The VPS releases the port a few seconds after the client goes away. Wait for it
+    # and say so if it stays busy, so a leftover listener is not mistaken for a live tunnel.
+    if [ "${SRT_SKIP_PORT_CHECK:-0}" != 1 ] && have ssh; then
+        _still=1
+        for _i in 1 2 3 4 5 6; do
+            if ! vps_port_listening "$_vps" "$_rport"; then _still=0; break; fi
+            sleep 2
+        done
+        if [ "$_still" = 1 ]; then
+            warn "порт $_rport на $VPS_HOST всё ещё слушается. Это не туннель '$_n' (он остановлен):"
+            warn "проверьте на VPS: ss -ltnp | grep :$_rport  — процесс sshd с этим портом"
+            warn "может держать другой живой туннель или висящий listener до таймаута keepalive."
+        else
+            info "порт $_rport на VPS освобождён"
+        fi
+    fi
     if [ "$_purge" = 1 ]; then
         if key_in_use "$_key"; then
             warn "key $_key is still used by another tunnel, kept"
@@ -534,6 +551,10 @@ cmd_remove() {
     else
         info "kept key $_key (use --purge-key to delete it)"
     fi
+}
+
+vps_port_listening() { # vps_port_listening USER@HOST PORT -> 0 when the port has a listener
+    vps_ssh "$1" "ss -ltn 2>/dev/null | grep -q ':$2 '" >/dev/null 2>&1
 }
 
 cmd_action() { # start|stop|restart|status NAME|all
@@ -547,13 +568,20 @@ cmd_action() { # start|stop|restart|status NAME|all
     fi
     for _n in $_names; do
         case "$_act" in
-            start)   svc_start "$_n"; info "$_n: started" ;;
+            start)   load "$_n"
+                     if vps_ssh "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1 || [ "${SRT_NO_KEY_CHECK:-0}" = 1 ]; then
+                         svc_start "$_n"; info "$_n: started"
+                     else
+                         warn "$_n: вход на VPS по ключу не работает, сервис не запущен. См.: srt key-help $_n"
+                         _rc=1
+                     fi ;;
             stop)    svc_stop "$_n"; info "$_n: stopped" ;;
             restart) svc_stop "$_n"; svc_start "$_n"; info "$_n: restarted" ;;
             status)  printf '%-14s %s\n' "$_n" "$(svc_status "$_n")" ;;
             *) die "unknown action: $_act" ;;
         esac
     done
+    return "${_rc:-0}"
 }
 
 cmd_logs() {
@@ -601,6 +629,41 @@ cmd_key() {
     echo "private key: $KEY_FILE"
     if [ -f "$KEY_FILE.pub" ]; then cat "$KEY_FILE.pub"; else echo "(no public key yet)"; fi
 }
+
+# key-help NAME: what to do so that the tunnel can log in to the VPS
+cmd_key_help() {
+    [ $# -ge 1 ] || die "usage: srt key-help NAME"
+    load "$1"
+    echo "Туннель '$NAME': чтобы он мог войти на VPS $VPS_USER@$VPS_HOST, на VPS должен быть его публичный ключ."
+    echo
+    if [ ! -f "$KEY_FILE.pub" ]; then
+        echo "Публичного ключа нет. Создайте: ssh-keygen -t ed25519 -N '' -f $KEY_FILE"
+        return 1
+    fi
+    echo "Публичный ключ:"
+    cat "$KEY_FILE.pub"
+    echo
+    echo "Вариант 1 (с этой машины, спросит пароль VPS один раз):"
+    if [ -n "${PROXY:-}" ]; then
+        _pc="$(PROXY="$PROXY" proxy_cmd)"
+        echo "  ssh-copy-id -i $KEY_FILE.pub \\"
+        echo "    -o \"ProxyCommand=$_pc %h %p\" -p $VPS_SSH_PORT $VPS_USER@$VPS_HOST"
+    else
+        echo "  ssh-copy-id -i $KEY_FILE.pub -p $VPS_SSH_PORT $VPS_USER@$VPS_HOST"
+    fi
+    echo
+    echo "Вариант 2 (вручную на VPS, под пользователем $VPS_USER):"
+    echo "  mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+    echo "  echo '$(cat "$KEY_FILE.pub")' >> ~/.ssh/authorized_keys"
+    echo "  chmod 600 ~/.ssh/authorized_keys"
+    echo
+    if vps_ssh "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1; then
+        echo "Проверка: вход по ключу РАБОТАЕТ. Запустите: srt start $NAME"
+    else
+        echo "Проверка: вход по ключу пока НЕ работает."
+    fi
+}
+
 
 cmd_run() { # foreground run of one tunnel; the service managers call this
     [ $# -ge 1 ] || die "usage: srt run NAME"
@@ -993,6 +1056,33 @@ tunnel_wizard() { # tunnel_wizard MODE(add|edit) [NAME]; fills and saves the con
     # checked now, with the real proxy and key; a warning is shown, the save is not blocked
     check_bind "$VPS_USER@$VPS_HOST" "$BIND_ADDR" "$PROXY" "$KEY_FILE" || true
 
+    # the key must work on the VPS before the tunnel is started; otherwise offer to install it
+    _key_ok=0
+    if _vps_ssh_with "$PROXY" "$KEY_FILE" "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1; then
+        printf '  %b✔%b вход на VPS по ключу работает\n' "$C_GRN" "$C_RST" >&2
+        _key_ok=1
+    else
+        printf '  %b✖%b вход на VPS по ключу НЕ работает: публичный ключ ещё не установлен на VPS\n' "$C_RED" "$C_RST" >&2
+        printf '  публичный ключ:\n    %s\n' "$(cat "$KEY_FILE.pub" 2>/dev/null)" >&2
+        if confirm "Установить ключ на VPS сейчас (ssh-copy-id, спросит пароль VPS один раз)?"; then
+            if [ -n "$PROXY" ]; then
+                _pc="$(PROXY="$PROXY" proxy_cmd)"
+                ssh-copy-id -i "$KEY_FILE.pub" -o "UserKnownHostsFile=$KNOWN_HOSTS" -o "StrictHostKeyChecking=accept-new" \
+                    -o "ProxyCommand=$_pc %h %p" -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_HOST" || true
+            else
+                ssh-copy-id -i "$KEY_FILE.pub" -o "UserKnownHostsFile=$KNOWN_HOSTS" -o "StrictHostKeyChecking=accept-new" \
+                    -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_HOST" || true
+            fi
+            if _vps_ssh_with "$PROXY" "$KEY_FILE" "$VPS_USER@$VPS_HOST" true >/dev/null 2>&1; then
+                printf '  %b✔%b ключ установлен, вход работает\n' "$C_GRN" "$C_RST" >&2
+                _key_ok=1
+            else
+                printf '  %b✖%b ключ всё ещё не работает. Проверьте пароль и адрес VPS.\n' "$C_RED" "$C_RST" >&2
+            fi
+        fi
+    fi
+
+
     printf '\n'; hr
     printf '  %bИтог%b\n' "$C_B" "$C_RST"
     printf '    туннель   %s\n' "$NAME"
@@ -1011,9 +1101,20 @@ tunnel_wizard() { # tunnel_wizard MODE(add|edit) [NAME]; fills and saves the con
     fi
 
     save_tunnel
-    printf '  %b✔%b сохранено: %s/%s.conf\n' "$C_GRN" "$C_RST" "$TUN_DIR" "$NAME" >&2
+    printf '  %b✔%b конфиг сохранён: %s/%s.conf\n' "$C_GRN" "$C_RST" "$TUN_DIR" "$NAME" >&2
 
-    if [ "$_mode" = edit ] && [ "$_was_active" = active -o "$_was_active" = running ] || [ "$_mode" = add ]; then
+    # start only when the key works on the VPS; otherwise the config is kept and the user is told why
+    if [ "$_key_ok" != 1 ]; then
+        printf '  %b!%b туннель НЕ запущен: вход на VPS по ключу не работает.\n' "$C_YEL" "$C_RST" >&2
+        printf '    Установите публичный ключ на VPS, затем: srt start %s\n' "$NAME" >&2
+        printf '    Ключ и готовая команда: srt key-help %s\n' "$NAME" >&2
+        return 1
+    fi
+
+    _start=0
+    if [ "$_mode" = add ]; then _start=1
+    elif [ "$_was_active" = active ] || [ "$_was_active" = running ]; then _start=1; fi
+    if [ "$_start" = 1 ]; then
         svc_start "$NAME"
         printf '  %b✔%b сервис: %s\n' "$C_GRN" "$C_RST" "$(svc_status "$NAME")" >&2
     fi
@@ -1279,6 +1380,7 @@ srt $SRT_VERSION: reverse SSH tunnels from this machine to a VPS
   srt logs NAME [-f]           service logs
   srt check [NAME|all]         VPS login, remote listener, service state
   srt key NAME                 public key to install on the VPS
+  srt key-help NAME            key, ssh-copy-id command, manual steps, login check
   srt setup-vps                run on the VPS as root: GatewayPorts for public binds
   srt security status|fail2ban|ufw-enable PORT..|keys-only|root-keys
                                host hardening (root): see: srt help security
@@ -1312,6 +1414,7 @@ main() {
         logs) cmd_logs "$@" ;;
         check) cmd_check "$@" ;;
         key) cmd_key "$@" ;;
+        key-help|keyhelp) cmd_key_help "$@" ;;
         run) cmd_run "$@" ;;
         setup-vps) cmd_setup_vps ;;
         security|sec) cmd_security "$@" ;;
