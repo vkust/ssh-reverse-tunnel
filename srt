@@ -10,7 +10,7 @@
 # POSIX sh only. Service backends: systemd (Linux), launchd (macOS), procd (OpenWrt).
 set -eu
 
-SRT_VERSION="1.2.0"
+SRT_VERSION="1.3.0"
 CONF_DIR="${SRT_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/srt}"
 TUN_DIR="$CONF_DIR/tunnels"
 RUN_DIR="$CONF_DIR/run"
