@@ -799,26 +799,68 @@ cmd_security() {
     esac
 }
 
-# ---------- interactive menu and live monitor ----------
+# ---------- interactive menu ----------
+# A menu of boxed pages. Every page is a function; actions that change state
+# ask first and show what will happen. Works only on a terminal; without one
+# (pipes, scripts) the CLI commands below are used instead.
+
+# colours: used only when the terminal supports them
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RST='\033[0m'; C_B='\033[1m'; C_DIM='\033[2m'
+    C_RED='\033[31m'; C_GRN='\033[32m'; C_YEL='\033[33m'; C_BLU='\033[34m'; C_CYN='\033[36m'
+else
+    C_RST=''; C_B=''; C_DIM=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''
+fi
 
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
-
 clear_screen() { if is_tty; then printf '\033[H\033[2J'; fi; return 0; }
 
-ask_enter() { printf '\nEnter — назад ' >&2; _x=""; IFS= read -r _x || true; }
+hr() { printf '%b%s%b\n' "$C_DIM" "────────────────────────────────────────────────────────────────" "$C_RST"; }
 
-menu_rows() { # numbered table of all tunnels, one line each
+header() { # header TITLE [SUBTITLE]
+    clear_screen
+    printf '%b┌─ srt %s ─%b %s\n' "$C_BLU" "$SRT_VERSION" "$C_RST" "$1"
+    [ -n "${2:-}" ] && printf '%b│%b  %s\n' "$C_BLU" "$C_RST" "$2"
+    hr
+}
+
+pause() { printf '\n%bEnter — назад%b ' "$C_DIM" "$C_RST" >&2; _x=""; IFS= read -r _x || true; }
+
+ask() { # ask PROMPT DEFAULT -> stdout; empty input keeps DEFAULT
+    if [ -n "$2" ]; then printf '  %s [%s]: ' "$1" "$2" >&2; else printf '  %s: ' "$1" >&2; fi
+    _a=""; IFS= read -r _a || _a=""
+    if [ -n "$_a" ]; then printf '%s' "$_a"; else printf '%s' "$2"; fi
+}
+
+confirm() { # confirm PROMPT -> 0 when the user types y
+    printf '  %b%s [y/N]:%b ' "$C_YEL" "$1" "$C_RST" >&2
+    _a=""; IFS= read -r _a || _a=""
+    case "$_a" in y|Y|yes|Yes|да|д) return 0 ;; *) return 1 ;; esac
+}
+
+status_badge() { # status_badge STATE -> coloured word
+    case "$1" in
+        active|running) printf '%b● работает%b' "$C_GRN" "$C_RST" ;;
+        activating)     printf '%b◐ запускается%b' "$C_YEL" "$C_RST" ;;
+        failed)         printf '%b✖ ошибка%b' "$C_RED" "$C_RST" ;;
+        *)              printf '%b○ остановлен%b' "$C_DIM" "$C_RST" ;;
+    esac
+}
+
+# ---------- tunnel list ----------
+
+tunnel_rows() { # one aligned row per tunnel, numbered from 1
     _i=0
     for _n in $(tunnel_names); do
         _i=$((_i + 1))
         load "$_n"
-        printf '  %2d) %-12s %-16s %-6s -> %-22s %-14s %s\n' "$_i" "$NAME" "$VPS_HOST" \
-            "$REMOTE_PORT" "$TARGET_HOST:$TARGET_PORT" "${PROXY:-прямой}" "$(svc_status "$NAME")"
+        printf '  %b%2d%b  %-12s %-18s %-6s → %-22s %-14s %s\n' \
+            "$C_CYN" "$_i" "$C_RST" "$NAME" "$VPS_HOST" "$REMOTE_PORT" \
+            "$TARGET_HOST:$TARGET_PORT" "${PROXY:-прямой}" "$(status_badge "$(svc_status "$NAME")")"
     done
-    return 0
 }
 
-tunnel_by_index() { # tunnel_by_index N -> tunnel name, 1-based
+tunnel_by_index() {
     _i=0
     for _n in $(tunnel_names); do
         _i=$((_i + 1))
@@ -827,46 +869,261 @@ tunnel_by_index() { # tunnel_by_index N -> tunnel name, 1-based
     return 1
 }
 
-pick_tunnel() { # pick_tunnel -> sets MENU_SEL; returns 1 when cancelled
+pick_tunnel() { # pick_tunnel -> MENU_SEL; returns 1 when cancelled or none exist
     MENU_SEL=""
     if [ -z "$(tunnel_names)" ]; then
-        echo "  Туннелей пока нет. Добавьте туннель пунктом меню." >&2
+        printf '  %bТуннелей пока нет.%b Добавьте первый в меню «Туннели».\n' "$C_YEL" "$C_RST" >&2
         return 1
     fi
-    menu_rows
-    printf '  Номер туннеля (Enter — отмена): ' >&2
+    tunnel_rows
+    printf '\n  Номер туннеля (Enter — отмена): ' >&2
     _x=""; IFS= read -r _x || _x=""
     [ -n "$_x" ] || return 1
-    case "$_x" in *[!0-9]*) echo "  нужен номер" >&2; return 1 ;; esac
-    MENU_SEL="$(tunnel_by_index "$_x")" || { echo "  нет туннеля с номером $_x" >&2; return 1; }
+    case "$_x" in *[!0-9]*) printf '  нужен номер\n' >&2; return 1 ;; esac
+    MENU_SEL="$(tunnel_by_index "$_x")" || { printf '  нет туннеля с номером %s\n' "$_x" >&2; return 1; }
     [ -n "$MENU_SEL" ]
 }
 
-last_log_line() { # last_log_line NAME -> last line of the service log, short
+# ---------- VPS checks used by add and edit ----------
+
+vps_gateway_ports() { # vps_gateway_ports USER@HOST PROXY KEY -> VPS GatewayPorts value, or "?"
+    _gp="$(_vps_ssh_with "$2" "$3" "$1" 'sshd -T 2>/dev/null | awk "\$1==\"gatewayports\"{print \$2; exit}"' 2>/dev/null || true)"
+    [ -n "$_gp" ] && printf '%s' "$_gp" || printf '?'
+}
+
+# ssh with explicit proxy and key, used before a tunnel config is loaded
+_vps_ssh_with() { # _vps_ssh_with PROXY KEY USER@HOST CMD...
+    _p="$1"; _k="$2"; _t="$3"; shift 3
+    [ -r "$_k" ] || return 1
+    if [ -n "$_p" ]; then
+        _pc="$(PROXY="$_p" proxy_cmd)" || return 1
+        HTTPS_PROXY="$_p"; export HTTPS_PROXY
+        ssh -i "$_k" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=15 -o "ProxyCommand=$_pc %h %p" "$_t" "$@"
+    else
+        ssh -i "$_k" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=15 "$_t" "$@"
+    fi
+}
+
+check_bind() { # check_bind USER@HOST BIND PROXY KEY: warn when the VPS would silently use 127.0.0.1
+    _gp="$(vps_gateway_ports "$1" "$3" "$4")"
+    case "$2:$_gp" in
+        127.0.0.1:*) return 0 ;;
+        *:clientspecified|*:yes)
+            printf '  %bOK%b  GatewayPorts=%s: порт будет слушать %s\n' "$C_GRN" "$C_RST" "$_gp" "$2" >&2
+            return 0 ;;
+        *:no)
+            printf '  %bВНИМАНИЕ%b  GatewayPorts=no на VPS: порт будет слушать только 127.0.0.1,\n' "$C_RED" "$C_RST" >&2
+            printf '            даже если указан %s. Исправить: srt setup-vps (на VPS, от root)\n' "$2" >&2
+            return 1 ;;
+        *)
+            printf '  %b?%b  не удалось прочитать GatewayPorts на VPS (нет входа или нет прав)\n' "$C_YEL" "$C_RST" >&2
+            return 1 ;;
+    esac
+}
+
+# ---------- add / edit (one wizard, used by both) ----------
+
+tunnel_wizard() { # tunnel_wizard MODE(add|edit) [NAME]; fills and saves the config
+    _mode="$1"; _old="${2:-}"
+    if [ "$_mode" = edit ]; then
+        load "$_old"
+        _o_name="$NAME"; _o_vps="$VPS_HOST"; _o_user="$VPS_USER"; _o_vport="$VPS_SSH_PORT"
+        _o_proxy="$PROXY"; _o_th="$TARGET_HOST"; _o_tp="$TARGET_PORT"
+        _o_rp="$REMOTE_PORT"; _o_bind="$BIND_ADDR"; _o_key="$KEY_FILE"
+    else
+        _o_name="" ; _o_vps="" ; _o_user="root"; _o_vport="22"; _o_proxy=""
+        _o_th="127.0.0.1"; _o_tp="22"; _o_rp=""; _o_bind="0.0.0.0"; _o_key=""
+    fi
+
+    header "$( [ "$_mode" = edit ] && echo "изменить туннель '$_o_name'" || echo "новый туннель")" \
+           "Enter оставляет значение в скобках"
+
+    if [ "$_mode" = edit ]; then NAME="$_o_name"; else
+        NAME="$(ask "Имя туннеля" "")"
+        is_name "$NAME" || { printf '  %bимя: a-z, 0-9, дефис%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+        if [ -f "$TUN_DIR/$NAME.conf" ]; then printf '  %bтакое имя уже есть%b\n' "$C_RED" "$C_RST" >&2; return 1; fi
+    fi
+
+    VPS_HOST="$(ask "Адрес VPS" "$_o_vps")"
+    is_host "$VPS_HOST" || { printf '  %bневерный адрес%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+    VPS_USER="$(ask "Пользователь на VPS" "$_o_user")"
+    is_user "$VPS_USER" || { printf '  %bневерный пользователь%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+    VPS_SSH_PORT="$(ask "SSH-порт VPS" "$_o_vport")"
+    is_port "$VPS_SSH_PORT" || { printf '  %bневерный порт%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+
+    _pr="$(ask "Прокси для исходящего SSH (host:port, пусто = напрямую)" "$_o_proxy")"
+    case "$_pr" in *"'"*|*'"'*|*" "*) printf '  %bпрокси содержит кавычки или пробелы%b\n' "$C_RED" "$C_RST" >&2; return 1 ;; esac
+    PROXY="$_pr"
+
+    TARGET_HOST="$(ask "Что открыть: 127.0.0.1 = эта машина, либо адрес в LAN" "$_o_th")"
+    is_host "$TARGET_HOST" || { printf '  %bневерный адрес%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+    TARGET_PORT="$(ask "Порт цели" "$_o_tp")"
+    is_port "$TARGET_PORT" || { printf '  %bневерный порт%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+
+    _def_rp="$_o_rp"; [ -n "$_def_rp" ] || _def_rp="$(next_free_port "$VPS_HOST")"
+    REMOTE_PORT="$(ask "Порт на VPS, снаружи" "$_def_rp")"
+    is_port "$REMOTE_PORT" || { printf '  %bневерный порт%b\n' "$C_RED" "$C_RST" >&2; return 1; }
+    _owner="$(port_owner "$VPS_HOST" "$REMOTE_PORT")"
+    if [ -n "$_owner" ] && [ "$_owner" != "$NAME" ]; then
+        printf '  %bпорт %s на %s уже занят туннелем «%s»%b\n' "$C_RED" "$REMOTE_PORT" "$VPS_HOST" "$_owner" "$C_RST" >&2
+        return 1
+    fi
+
+    printf '\n  %bАдрес прослушивания на VPS%b\n' "$C_B" "$C_RST" >&2
+    printf '    %b1%b) 0.0.0.0   — снаружи (доступен из интернета)\n' "$C_CYN" "$C_RST" >&2
+    printf '    %b2%b) 127.0.0.1 — только с самого VPS\n' "$C_CYN" "$C_RST" >&2
+    _bc="$(ask "Вариант" "$( [ "$_o_bind" = 127.0.0.1 ] && echo 2 || echo 1 )")"
+    case "$_bc" in
+        1) BIND_ADDR="0.0.0.0" ;;
+        2) BIND_ADDR="127.0.0.1" ;;
+        *) BIND_ADDR="$_bc" ; is_ipv4 "$BIND_ADDR" || { printf '  %bнужен 1, 2 или IPv4-адрес%b\n' "$C_RED" "$C_RST" >&2; return 1; } ;;
+    esac
+    KEY_FILE="$(ask "Ключ SSH для VPS" "${_o_key:-$(key_path_for "$VPS_HOST")}")"
+    case "$KEY_FILE" in *"'"*|*" "*) printf '  %bпуть с кавычками или пробелами%b\n' "$C_RED" "$C_RST" >&2; return 1 ;; esac
+
+    if [ ! -f "$KEY_FILE" ]; then
+        mkdir -p "$(dirname "$KEY_FILE")"; chmod 700 "$(dirname "$KEY_FILE")" 2>/dev/null || true
+        ssh-keygen -q -t ed25519 -N "" -C "srt@$(hostname 2>/dev/null || echo host)" -f "$KEY_FILE" </dev/null
+        printf '  ключ создан: %s\n' "$KEY_FILE" >&2
+    fi
+
+    # checked now, with the real proxy and key; a warning is shown, the save is not blocked
+    check_bind "$VPS_USER@$VPS_HOST" "$BIND_ADDR" "$PROXY" "$KEY_FILE" || true
+
+    printf '\n'; hr
+    printf '  %bИтог%b\n' "$C_B" "$C_RST"
+    printf '    туннель   %s\n' "$NAME"
+    printf '    VPS       %s@%s:%s\n' "$VPS_USER" "$VPS_HOST" "$VPS_SSH_PORT"
+    printf '    снаружи   %s:%s  →  %s:%s\n' "$BIND_ADDR" "$REMOTE_PORT" "$TARGET_HOST" "$TARGET_PORT"
+    printf '    прокси    %s\n' "${PROXY:-напрямую}"
+    printf '    ключ      %s\n' "$KEY_FILE"
+    hr
+    if [ "$_mode" = edit ]; then
+        confirm "Сохранить изменения?" || { printf '  отменено\n' >&2; return 1; }
+        # the old service is stopped; it is started again below if it was running
+        _was_active="$(svc_status "$_old")"
+        if [ "$_old" != "$NAME" ]; then svc_stop "$_old"; rm -f "$TUN_DIR/$_old.conf"; svc_remove "$_old"; fi
+    else
+        confirm "Сохранить и запустить туннель?" || { printf '  отменено\n' >&2; return 1; }
+    fi
+
+    save_tunnel
+    printf '  %b✔%b сохранено: %s/%s.conf\n' "$C_GRN" "$C_RST" "$TUN_DIR" "$NAME" >&2
+
+    if [ "$_mode" = edit ] && [ "$_was_active" = active -o "$_was_active" = running ] || [ "$_mode" = add ]; then
+        svc_start "$NAME"
+        printf '  %b✔%b сервис: %s\n' "$C_GRN" "$C_RST" "$(svc_status "$NAME")" >&2
+    fi
+    return 0
+}
+
+# ---------- single-tunnel page ----------
+
+tunnel_page() { # tunnel_page NAME
+    _n="$1"
+    while :; do
+        load "$_n"
+        header "туннель: $_n" "$(status_badge "$(svc_status "$_n")")   $VPS_HOST:$REMOTE_PORT → $TARGET_HOST:$TARGET_PORT"
+        printf '  %b1%b  подробности\n' "$C_CYN" "$C_RST"
+        printf '  %b2%b  изменить настройки\n' "$C_CYN" "$C_RST"
+        printf '  %b3%b  запустить\n' "$C_CYN" "$C_RST"
+        printf '  %b4%b  остановить\n' "$C_CYN" "$C_RST"
+        printf '  %b5%b  перезапустить\n' "$C_CYN" "$C_RST"
+        printf '  %b6%b  логи\n' "$C_CYN" "$C_RST"
+        printf '  %b7%b  проверка через VPS\n' "$C_CYN" "$C_RST"
+        printf '  %b8%b  публичный ключ для VPS\n' "$C_CYN" "$C_RST"
+        printf '  %b9%b  удалить туннель\n' "$C_RED" "$C_RST"
+        hr
+        printf '  %b0%b  назад\n' "$C_DIM" "$C_RST"
+        printf '\n> ' >&2
+        _c=""; IFS= read -r _c || return 0
+        case "$_c" in
+            1) header "туннель: $_n"; ( cmd_show "$_n" ) || true; pause ;;
+            2) if tunnel_wizard edit "$_n"; then pause; else pause; fi
+               # the name may have changed; follow the new name
+               NAME_NOW="$(load "$_n" 2>/dev/null; printf '%s' "${NAME:-$_n}")" ;;
+            3) ( cmd_action start "$_n" ) || true; pause ;;
+            4) ( cmd_action stop "$_n" ) || true; pause ;;
+            5) ( cmd_action restart "$_n" ) || true; pause ;;
+            6) header "логи: $_n"; ( cmd_logs "$_n" ) || true; pause ;;
+            7) header "проверка: $_n"; ( cmd_check "$_n" ) || true; pause ;;
+            8) header "публичный ключ: $_n"; ( cmd_key "$_n" ) || true; pause ;;
+            9) header "удаление: $_n"
+               if confirm "Удалить туннель «$_n» и остановить сервис?"; then
+                   ( cmd_remove "$_n" -y ) || true
+                   return 0
+               fi
+               pause ;;
+            0|"") return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+# ---------- tunnels page ----------
+
+tunnels_page() {
+    while :; do
+        header "туннели" "$(tunnel_count_text)"
+        if [ -n "$(tunnel_names)" ]; then tunnel_rows; else printf '  (туннелей нет)\n'; fi
+        hr
+        printf '  %b1%b  открыть туннель (настройки, запуск, логи)\n' "$C_CYN" "$C_RST"
+        printf '  %b2%b  добавить туннель\n' "$C_CYN" "$C_RST"
+        printf '  %b3%b  запустить все\n' "$C_CYN" "$C_RST"
+        printf '  %b4%b  остановить все\n' "$C_CYN" "$C_RST"
+        printf '  %b5%b  проверить все через VPS\n' "$C_CYN" "$C_RST"
+        hr
+        printf '  %b0%b  назад\n' "$C_DIM" "$C_RST"
+        printf '\n> ' >&2
+        _c=""; IFS= read -r _c || return 0
+        case "$_c" in
+            1) if pick_tunnel; then tunnel_page "$MENU_SEL"; fi ;;
+            2) tunnel_wizard add || true; pause ;;
+            3) header "запуск всех"; ( cmd_action start all ) || true; pause ;;
+            4) header "остановка всех"; ( cmd_action stop all ) || true; pause ;;
+            5) header "проверка всех"; ( cmd_check all ) || true; pause ;;
+            0|"") return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+tunnel_count_text() {
+    _t=0; _up=0
+    for _n in $(tunnel_names); do
+        _t=$((_t + 1))
+        case "$(svc_status "$_n")" in active|running) _up=$((_up + 1)) ;; esac
+    done
+    printf '%s всего, %s работает' "$_t" "$_up"
+}
+
+# ---------- monitor ----------
+
+last_log_line() {
     _l=""
     case "$(svc_mgr)" in
         systemd) _l="$(journalctl --user -u "srt@$1.service" -n 1 --no-pager -o cat 2>/dev/null || true)" ;;
         launchd) _l="$(tail -n 1 "$(launchd_log "$1")" 2>/dev/null || true)" ;;
-        procd)   _l="(смотрите: srt logs $1)" ;;
+        procd)   _l="(srt logs $1)" ;;
         none)    _l="$(tail -n 1 "$RUN_DIR/$1.log" 2>/dev/null || true)" ;;
     esac
     [ -n "$_l" ] || _l="-"
-    printf '%s' "$_l" | cut -c1-100
+    printf '%s' "$_l" | cut -c1-90
 }
 
-cmd_monitor() { # live status of all tunnels; refreshes every 3 s, Ctrl-C returns
+cmd_monitor() {
     if [ -z "$(tunnel_names)" ]; then echo "Туннелей пока нет: srt add"; return 0; fi
     MON_STOP=0
     trap 'MON_STOP=1' INT
     while [ "$MON_STOP" = 0 ]; do
-        clear_screen
-        echo "srt: мониторинг туннелей   обновление каждые 3 с, Ctrl-C — выход   $(date '+%H:%M:%S')"
-        echo
-        menu_rows
-        echo
-        echo "Последние строки логов:"
+        header "мониторинг" "обновление каждые 3 с · Ctrl-C — выход · $(date '+%H:%M:%S')"
+        tunnel_rows
+        hr
+        printf '  %bпоследние строки логов%b\n' "$C_B" "$C_RST"
         for _n in $(tunnel_names); do
-            printf '  %-12s %s\n' "$_n" "$(last_log_line "$_n")"
+            printf '  %b%-12s%b %s\n' "$C_DIM" "$_n" "$C_RST" "$(last_log_line "$_n")"
         done
         sleep 3 || true
     done
@@ -874,106 +1131,131 @@ cmd_monitor() { # live status of all tunnels; refreshes every 3 s, Ctrl-C return
     return 0
 }
 
-tunnel_menu() { # tunnel_menu NAME: actions on one tunnel
-    _n="$1"
+# ---------- updates ----------
+
+SRT_REPO_URL="https://github.com/vkust/ssh-reverse-tunnel"
+SRT_RAW_URL="https://raw.githubusercontent.com/vkust/ssh-reverse-tunnel/main"
+
+remote_version() { # latest version from main, read from the published srt file
+    _v="$(curl -fsSL --max-time 15 "$SRT_RAW_URL/srt" 2>/dev/null | sed -n 's/^SRT_VERSION="\(.*\)"$/\1/p' | head -n 1)"
+    [ -n "$_v" ] && printf '%s' "$_v" || printf ''
+}
+
+version_gt() { # version_gt A B -> 0 when A is newer than B (dotted numbers)
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]
+}
+
+cmd_update_check() {
+    if ! have curl; then printf '  %bнужен curl%b\n' "$C_RED" "$C_RST"; return 1; fi
+    printf '  текущая версия: %s\n' "$SRT_VERSION"
+    _r="$(remote_version)"
+    if [ -z "$_r" ]; then printf '  %bне удалось получить версию с GitHub%b\n' "$C_RED" "$C_RST"; return 1; fi
+    printf '  версия на GitHub: %s\n' "$_r"
+    if version_gt "$_r" "$SRT_VERSION"; then
+        printf '  %bдоступно обновление%b\n' "$C_GRN" "$C_RST"; return 2
+    fi
+    printf '  %bуже последняя версия%b\n' "$C_GRN" "$C_RST"; return 0
+}
+
+cmd_update() { # download and run the published installer; tunnels keep running
+    cmd_update_check || [ $? = 2 ] || return 1
+    if ! have curl; then die "нужен curl"; fi
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/srt-update.XXXXXX.sh")" || die "не удалось создать временный файл"
+    curl -fsSL --max-time 60 "$SRT_RAW_URL/install.sh" -o "$_tmp" || { rm -f "$_tmp"; die "не удалось скачать install.sh"; }
+    sh -n "$_tmp" || { rm -f "$_tmp"; die "скачанный install.sh не проходит проверку синтаксиса"; }
+    info "установка обновления (-y, без туннеля: существующие туннели не меняются)"
+    sh "$_tmp" -y --no-tunnel --prefix "$(dirname "$SRT_SELF")" || { rm -f "$_tmp"; die "установка не удалась"; }
+    rm -f "$_tmp"
+    info "обновлено до $(remote_version || echo ?). Перезапустите туннели: srt restart all"
+}
+
+updates_page() {
     while :; do
-        clear_screen
-        load "$_n"
-        echo "Туннель '$_n':  $VPS_HOST:$REMOTE_PORT  ->  $TARGET_HOST:$TARGET_PORT   [$(svc_status "$_n")]"
-        echo
-        echo "  1) подробно"
-        echo "  2) запустить"
-        echo "  3) остановить"
-        echo "  4) перезапустить"
-        echo "  5) логи"
-        echo "  6) проверить через VPS"
-        echo "  7) публичный ключ для VPS"
-        echo "  8) удалить туннель"
-        echo "  0) назад"
-        printf '> ' >&2
+        header "обновления"
+        printf '  текущая версия: %s\n' "$SRT_VERSION"
+        printf '  репозиторий:    %s\n' "$SRT_REPO_URL"
+        hr
+        printf '  %b1%b  проверить обновления\n' "$C_CYN" "$C_RST"
+        printf '  %b2%b  обновить srt\n' "$C_CYN" "$C_RST"
+        printf '  %b0%b  назад\n' "$C_DIM" "$C_RST"
+        printf '\n> ' >&2
         _c=""; IFS= read -r _c || return 0
         case "$_c" in
-            1) ( cmd_show "$_n" ) || true; ask_enter ;;
-            2) ( cmd_action start "$_n" ) || true; ask_enter ;;
-            3) ( cmd_action stop "$_n" ) || true; ask_enter ;;
-            4) ( cmd_action restart "$_n" ) || true; ask_enter ;;
-            5) ( cmd_logs "$_n" ) || true; ask_enter ;;
-            6) ( cmd_check "$_n" ) || true; ask_enter ;;
-            7) ( cmd_key "$_n" ) || true; ask_enter ;;
-            8) if ( cmd_remove "$_n" ); then return 0; fi; ask_enter ;;
+            1) cmd_update_check || true; pause ;;
+            2) if confirm "Обновить srt до последней версии с GitHub?"; then
+                   ( cmd_update ) || true
+               fi
+               pause ;;
             0|"") return 0 ;;
             *) ;;
         esac
     done
 }
 
-security_menu() { # interactive page for host hardening
+# ---------- security page ----------
+
+security_page() {
     while :; do
-        clear_screen
-        echo "Безопасность этого хоста"
-        echo
-        echo "  1) статус (только чтение)"
-        echo "  2) установить fail2ban (защита sshd от перебора паролей)"
-        echo "  3) удалить srt-jail fail2ban"
-        echo "  4) включить файрвол ufw (закрыть всё, кроме ssh и портов туннелей)"
-        echo "  5) выключить файрвол ufw"
-        echo "  6) root только по ключу (PermitRootLogin prohibit-password)"
-        echo "  7) вход только по ключу для всех (отключить пароли, с проверкой ключа)"
-        echo "  0) назад"
-        printf '> ' >&2
+        header "безопасность этого хоста" "нужны права root для изменений"
+        printf '  %b1%b  статус (только чтение)\n' "$C_CYN" "$C_RST"
+        printf '  %b2%b  fail2ban: защита sshd от перебора\n' "$C_CYN" "$C_RST"
+        printf '  %b3%b  снять srt-jail fail2ban\n' "$C_CYN" "$C_RST"
+        printf '  %b4%b  включить ufw (закрыть входящие, открыть ssh и порты туннелей)\n' "$C_CYN" "$C_RST"
+        printf '  %b5%b  выключить ufw\n' "$C_CYN" "$C_RST"
+        printf '  %b6%b  root только по ключу\n' "$C_CYN" "$C_RST"
+        printf '  %b7%b  вход только по ключу для всех (с проверкой ключа)\n' "$C_CYN" "$C_RST"
+        hr
+        printf '  %b0%b  назад\n' "$C_DIM" "$C_RST"
+        printf '\n> ' >&2
         _c=""; IFS= read -r _c || return 0
         case "$_c" in
-            1) ( cmd_security status ) || true; ask_enter ;;
-            2) if yesno "Установить и включить fail2ban?" y; then ( cmd_security fail2ban ) || true; fi; ask_enter ;;
-            3) if yesno "Убрать srt-jail fail2ban?" n; then ( cmd_security fail2ban-remove ) || true; fi; ask_enter ;;
-            4) printf '  Порты туннелей, которые надо оставить открытыми (через пробел, Enter — только ssh): ' >&2
+            1) header "статус"; ( cmd_security status ) || true; pause ;;
+            2) header "fail2ban"; if confirm "Установить и включить fail2ban?"; then ( cmd_security fail2ban ) || true; fi; pause ;;
+            3) header "fail2ban"; if confirm "Снять srt-jail?"; then ( cmd_security fail2ban-remove ) || true; fi; pause ;;
+            4) header "ufw"
+               printf '  порты туннелей, которые оставить открытыми (через пробел): ' >&2
                _p=""; IFS= read -r _p || _p=""
-               if yesno "Включить ufw: закрыть входящие, открыть ssh и ${_p:-ничего}?" n; then
-                   # shellcheck disable=SC2086
-                   ( cmd_security ufw-enable $_p ) || true
-               fi; ask_enter ;;
-            5) if yesno "Выключить ufw?" n; then ( cmd_security ufw-disable ) || true; fi; ask_enter ;;
-            6) if yesno "Root войдёт только по ключу. Пароль для root перестанет работать. Продолжить?" n; then
-                   ( cmd_security root-keys ) || true
-               fi; ask_enter ;;
-            7) printf '  Путь к приватному ключу, который уже входит без пароля: ' >&2
+               # shellcheck disable=SC2086
+               if confirm "Включить ufw: ssh и порты [$_p]?"; then ( cmd_security ufw-enable $_p ) || true; fi
+               pause ;;
+            5) header "ufw"; if confirm "Выключить ufw?"; then ( cmd_security ufw-disable ) || true; fi; pause ;;
+            6) header "root по ключу"
+               printf '  %bпароль root перестанет работать%b\n' "$C_YEL" "$C_RST"
+               if confirm "Продолжить?"; then ( cmd_security root-keys ) || true; fi; pause ;;
+            7) header "вход по ключу"
+               printf '  путь к приватному ключу, который уже входит без пароля: ' >&2
                _k=""; IFS= read -r _k || _k=""
-               if [ -n "$_k" ] && yesno "Проверю вход по этому ключу и отключу пароли. Продолжить?" n; then
+               if [ -n "$_k" ] && confirm "Проверить вход по ключу и отключить пароли?"; then
                    ( SRT_SEC_KEY="$_k" cmd_security keys-only ) || true
-               fi; ask_enter ;;
+               fi
+               pause ;;
             0|"") return 0 ;;
             *) ;;
         esac
     done
 }
 
-cmd_menu() { # top-level interactive menu
+# ---------- main menu ----------
+
+cmd_menu() {
     while :; do
-        clear_screen
-        echo "srt $SRT_VERSION — управление туннелями"
-        echo
-        if [ -n "$(tunnel_names)" ]; then menu_rows; else echo "  (туннелей пока нет)"; fi
-        echo
-        echo "  1) мониторинг (живой статус)"
-        echo "  2) управление туннелем"
-        echo "  3) добавить туннель"
-        echo "  4) проверить все туннели через VPS"
-        echo "  5) запустить все"
-        echo "  6) остановить все"
-        echo "  7) платформа и зависимости"
-        echo "  8) безопасность (fail2ban, ключи, файрвол)"
-        echo "  0) выход"
-        printf '> ' >&2
+        header "главное меню" "$(tunnel_count_text) · $(hostname 2>/dev/null || echo host)"
+        printf '  %b1%b  туннели          %b— список, настройки, запуск%b\n' "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '  %b2%b  мониторинг       %b— живой статус и логи%b\n' "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '  %b3%b  безопасность     %b— fail2ban, ufw, ключи%b\n' "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '  %b4%b  обновления       %b— проверить и обновить srt%b\n' "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        printf '  %b5%b  платформа        %b— система, пакеты, сервисы%b\n' "$C_CYN" "$C_RST" "$C_DIM" "$C_RST"
+        hr
+        printf '  %b0%b  выход\n' "$C_DIM" "$C_RST"
+        printf '\n> ' >&2
         _c=""; IFS= read -r _c || return 0
         case "$_c" in
-            1) ( cmd_monitor ) || true ;;
-            2) if pick_tunnel; then tunnel_menu "$MENU_SEL"; fi ;;
-            3) ( cmd_add ) || true; ask_enter ;;
-            4) ( cmd_check all ) || true; ask_enter ;;
-            5) ( cmd_action start all ) || true; ask_enter ;;
-            6) ( cmd_action stop all ) || true; ask_enter ;;
-            7) ( cmd_platform ) || true; ask_enter ;;
-            8) security_menu ;;
+            1) tunnels_page ;;
+            2) cmd_monitor || true ;;
+            3) security_page ;;
+            4) updates_page ;;
+            5) header "платформа"; ( cmd_platform ) || true; pause ;;
             0|q|Q) return 0 ;;
             *) ;;
         esac
@@ -1032,6 +1314,8 @@ main() {
         run) cmd_run "$@" ;;
         setup-vps) cmd_setup_vps ;;
         security|sec) cmd_security "$@" ;;
+        update) cmd_update ;;
+        update-check|check-update) cmd_update_check || true ;;
         platform) cmd_platform ;;
         uninstall) cmd_uninstall ;;
         version|--version) echo "$SRT_VERSION" ;;
