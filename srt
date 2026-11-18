@@ -813,6 +813,7 @@ else
 fi
 
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
+have() { command -v "$1" >/dev/null 2>&1; }
 clear_screen() { if is_tty; then printf '\033[H\033[2J'; fi; return 0; }
 
 hr() { printf '%b%s%b\n' "$C_DIM" "────────────────────────────────────────────────────────────────" "$C_RST"; }
@@ -1315,7 +1316,7 @@ main() {
         setup-vps) cmd_setup_vps ;;
         security|sec) cmd_security "$@" ;;
         update) cmd_update ;;
-        update-check|check-update) cmd_update_check || true ;;
+        update-check|check-update) cmd_update_check ;;
         platform) cmd_platform ;;
         uninstall) cmd_uninstall ;;
         version|--version) echo "$SRT_VERSION" ;;
